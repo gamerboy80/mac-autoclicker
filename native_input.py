@@ -204,7 +204,11 @@ class MacNativeInput:
     @position.setter
     def position(self, xy: tuple[float, float]) -> None:
         x, y = xy
-        self.core_graphics.CGWarpMouseCursorPosition(CGPoint(float(x), float(y)))
+        result = self.core_graphics.CGWarpMouseCursorPosition(
+            CGPoint(float(x), float(y))
+        )
+        if result != 0:
+            raise NativeInputError(f"Could not move the cursor to {int(x)}, {int(y)}")
 
     @property
     def keyboard_events_running(self) -> bool:
@@ -278,7 +282,8 @@ class MacNativeInput:
             None, event_type, CGPoint(x, y), button_id
         )
         if not event:
-            return
+            action = "press" if down else "release"
+            raise NativeInputError(f"Could not create mouse {action} event")
         try:
             self._mark_generated_event(event)
             self.core_graphics.CGEventPost(KCG_HID_EVENT_TAP, event)

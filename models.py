@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field, replace
 
-from config import DEFAULT_EXIT_HOTKEY, DEFAULT_TOGGLE_HOTKEY
+from config import DEFAULT_EXIT_HOTKEY, DEFAULT_STOP_HOTKEY, DEFAULT_TOGGLE_HOTKEY
 
 
 MOUSE_BUTTONS = ("left", "right", "middle")
@@ -167,6 +167,7 @@ class ClickSettings:
     mouse_down_seconds: float = 0.0
     activation_mode: str = "toggle"
     toggle_hotkey: str = DEFAULT_TOGGLE_HOTKEY
+    stop_hotkey: str = DEFAULT_STOP_HOTKEY
     exit_hotkey: str = DEFAULT_EXIT_HOTKEY
 
 
@@ -372,6 +373,10 @@ def sanitize_click_settings(payload: dict, current: ClickSettings) -> ClickSetti
         hotkey = parse_hotkey(payload["toggle_hotkey"])
         if has_regular_key(hotkey):
             updates["toggle_hotkey"] = format_hotkey(hotkey)
+    if "stop_hotkey" in payload:
+        hotkey = parse_hotkey(payload["stop_hotkey"])
+        if has_regular_key(hotkey):
+            updates["stop_hotkey"] = format_hotkey(hotkey)
     if "exit_hotkey" in payload:
         hotkey = parse_hotkey(payload["exit_hotkey"])
         if has_regular_key(hotkey):

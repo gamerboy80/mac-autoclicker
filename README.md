@@ -65,10 +65,18 @@ application again.
 ## Repeater
 
 - Start and Stop control repeated mouse clicks or keyboard shortcuts.
-- The clicker hotkey defaults to `F6`; the exit hotkey defaults to `F8`.
+- The clicker hotkey defaults to `F6`, Stop All defaults to `F7`, and the exit
+  hotkey defaults to `F8`.
+- Stop All immediately cancels the repeater, macros, recording, and position
+  picking without quitting the application.
+- A menu-bar control provides Show Window, Start/Stop, Stop All, and Quit while
+  the application is running.
 - Activation can toggle on each hotkey press or run only while held.
-- Mouse controls include button, single/double click, hold time, cursor mode,
-  fixed position, and cursor restoration.
+- Mouse controls include button, single/double click, hold time, an optional
+  fixed cursor position, and cursor restoration. Leave the fixed-position
+  checkbox off to click without moving the cursor.
+- Capture Cursor Position waits for the next click anywhere on screen, then
+  uses that click as the fixed X/Y point.
 - Keyboard controls accept a key or multi-key shortcut through press-to-capture.
 - Timing controls include actions per second, start delay, random jitter, action
   limit, time limit, and key hold time.
@@ -86,3 +94,5 @@ application again.
   macro from captured mouse and keyboard events.
 - Changes are saved directly through the application service to
   `autoclicker_settings.json`.
+- Stopping a macro automatically releases keys and mouse buttons left held by
+  separate down events.

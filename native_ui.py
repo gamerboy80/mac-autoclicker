@@ -24,6 +24,7 @@ from AppKit import (
     NSEventModifierFlagOption,
     NSEventModifierFlagShift,
     NSFont,
+    NSImage,
     NSMakeRect,
     NSMakeSize,
     NSMenu,
@@ -31,6 +32,7 @@ from AppKit import (
     NSMiniaturizableWindowMask,
     NSPopUpButton,
     NSScrollView,
+    NSStatusBar,
     NSTabView,
     NSTabViewItem,
     NSTableColumn,
@@ -39,6 +41,7 @@ from AppKit import (
     NSTitledWindowMask,
     NSClosableWindowMask,
     NSView,
+    NSVariableStatusItemLength,
     NSWindow,
 )
 from Foundation import NSNotFound, NSObject, NSTimer
@@ -55,7 +58,6 @@ ACTIVATION_MODES = ("toggle", "hold")
 OUTPUT_MODES = ("mouse", "keyboard")
 MOUSE_BUTTONS = ("left", "right", "middle")
 CLICK_TYPES = ("single", "double")
-POSITION_MODES = ("follow", "fixed")
 RUN_MODES = ("once", "repeat", "toggle", "hold")
 MOVE_MODES = ("absolute", "relative")
 
@@ -176,6 +178,7 @@ class AutoClickerAppDelegate(NSObject):
         self.last_recorded_macro_id = ""
         self.position_pick_event_index: Optional[int] = None
         self.position_pick_token: Optional[int] = None
+        self.repeater_position_pick_token: Optional[int] = None
         self.capture_target: Optional[str] = None
         self.capture_display: Optional[NSTextField] = None
         self.capture_monitor = None
@@ -183,10 +186,13 @@ class AutoClickerAppDelegate(NSObject):
         self.capture_pending_parts: frozenset[str] = frozenset()
         self.capture_restore_hotkeys = False
         self.refresh_timer = None
+        self.status_item = None
+        self.status_toggle_menu_item = None
         return self
 
     def applicationDidFinishLaunching_(self, _notification) -> None:
         self._build_window()
+        self._build_status_item()
         self.service.set_shutdown_callback(self.requestTerminate)
         self.state_payload = self.service.state()
         self._apply_settings(self.state_payload["settings"])
@@ -207,6 +213,9 @@ class AutoClickerAppDelegate(NSObject):
             self.refresh_timer.invalidate()
             self.refresh_timer = None
         self.service.shutdown()
+        if self.status_item is not None:
+            NSStatusBar.systemStatusBar().removeStatusItem_(self.status_item)
+            self.status_item = None
 
     def requestTerminate(self) -> None:
         self.performSelectorOnMainThread_withObject_waitUntilDone_(
@@ -245,15 +254,17 @@ class AutoClickerAppDelegate(NSObject):
         content.addSubview_(self.count_label)
 
         self.toggle_button = _button("Start", 22, 710, 96, "toggleClicker:")
+        self.stop_all_button = _button("Stop All", 126, 710, 96, "emergencyStop:")
         self.global_button = _button(
-            "Enable Global Hotkeys", 126, 710, 176, "toggleGlobalHotkeys:"
+            "Enable Global Hotkeys", 230, 710, 176, "toggleGlobalHotkeys:"
         )
         self.cursor_button = _button(
-            "Use Cursor Position", 310, 710, 162, "useCursorPosition:"
+            "Capture Cursor Position", 414, 710, 180, "useCursorPosition:"
         )
         self.quit_button = _button("Quit", 1064, 710, 94, "quitApplication:")
         for button in (
             self.toggle_button,
+            self.stop_all_button,
             self.global_button,
             self.cursor_button,
             self.quit_button,
@@ -265,6 +276,47 @@ class AutoClickerAppDelegate(NSObject):
         content.addSubview_(self.tab_view)
         self._build_repeater_tab()
         self._build_macros_tab()
+
+    def _build_status_item(self) -> None:
+        self.status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(
+            NSVariableStatusItemLength
+        )
+        status_button = self.status_item.button()
+        image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+            "cursorarrow.click", APP_TITLE
+        )
+        if image is None:
+            status_button.setTitle_("AC")
+        else:
+            image.setTemplate_(True)
+            status_button.setImage_(image)
+        status_button.setToolTip_(APP_TITLE)
+
+        menu = NSMenu.alloc().initWithTitle_(APP_TITLE)
+        show_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Show Window", "showWindow:", ""
+        )
+        self.status_toggle_menu_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Start", "toggleClicker:", ""
+        )
+        stop_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Stop All", "emergencyStop:", ""
+        )
+        quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Quit", "quitApplication:", ""
+        )
+        for item in (show_item, self.status_toggle_menu_item, stop_item, quit_item):
+            item.setTarget_(self)
+        menu.addItem_(show_item)
+        menu.addItem_(self.status_toggle_menu_item)
+        menu.addItem_(stop_item)
+        menu.addItem_(NSMenuItem.separatorItem())
+        menu.addItem_(quit_item)
+        self.status_item.setMenu_(menu)
+
+    def showWindow_(self, _sender) -> None:
+        self.window.makeKeyAndOrderFront_(None)
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
 
     def _build_repeater_tab(self) -> None:
         item = NSTabViewItem.alloc().initWithIdentifier_("repeater")
@@ -282,31 +334,37 @@ class AutoClickerAppDelegate(NSObject):
 
         hotkey_view = hotkeys.contentView()
         self.activation_popup = _popup(
-            ["Toggle", "Hold"], 170, 218, 220, "settingsChanged:"
+            ["Toggle", "Hold"], 170, 222, 220, "settingsChanged:"
         )
-        self.toggle_hotkey_field = _field(170, 170, 155, "F6", editable=False)
-        self.exit_hotkey_field = _field(170, 122, 155, "F8", editable=False)
-        self.toggle_hotkey_button = _button("Set", 334, 168, 70, "captureHotkey:")
-        self.exit_hotkey_button = _button("Set", 334, 120, 70, "captureHotkey:")
+        self.toggle_hotkey_field = _field(170, 178, 155, "F6", editable=False)
+        self.stop_hotkey_field = _field(170, 134, 155, "F7", editable=False)
+        self.exit_hotkey_field = _field(170, 90, 155, "F8", editable=False)
+        self.toggle_hotkey_button = _button("Set", 334, 176, 70, "captureHotkey:")
+        self.stop_hotkey_button = _button("Set", 334, 132, 70, "captureHotkey:")
+        self.exit_hotkey_button = _button("Set", 334, 88, 70, "captureHotkey:")
         self.toggle_hotkey_button.setTag_(1)
+        self.stop_hotkey_button.setTag_(6)
         self.exit_hotkey_button.setTag_(2)
         for label in (
-            _label("Activation", 18, 221, 140),
-            _label("Clicker hotkey", 18, 173, 140),
-            _label("Exit hotkey", 18, 125, 140),
+            _label("Activation", 18, 225, 140),
+            _label("Clicker hotkey", 18, 181, 140),
+            _label("Stop-all hotkey", 18, 137, 140),
+            _label("Exit hotkey", 18, 93, 140),
         ):
             hotkey_view.addSubview_(label)
         for control in (
             self.activation_popup,
             self.toggle_hotkey_field,
+            self.stop_hotkey_field,
             self.exit_hotkey_field,
             self.toggle_hotkey_button,
+            self.stop_hotkey_button,
             self.exit_hotkey_button,
         ):
             control.setTarget_(self)
             hotkey_view.addSubview_(control)
         hotkey_note = _label(
-            "Global shortcuts are enabled when the app starts.", 18, 70, 460, 20, size=11
+            "Global shortcuts are enabled when the app starts.", 18, 48, 460, 20, size=11
         )
         hotkey_note.setTextColor_(NSColor.secondaryLabelColor())
         hotkey_view.addSubview_(hotkey_note)
@@ -349,20 +407,23 @@ class AutoClickerAppDelegate(NSObject):
             repeater_view.addSubview_(control)
 
         position_view = position.contentView()
-        self.position_popup = _popup(
-            ["Follow Cursor", "Fixed Point"], 170, 224, 220, "settingsChanged:"
+        self.fixed_position_checkbox = _checkbox(
+            "Move cursor to fixed point before clicking",
+            18,
+            224,
+            360,
+            "settingsChanged:",
         )
         self.fixed_x_field = _field(170, 178, 102, "0")
         self.fixed_y_field = _field(288, 178, 102, "0")
         self.restore_checkbox = _checkbox(
-            "Return cursor after each click", 170, 128, 270, "settingsChanged:"
+            "Return cursor after fixed click", 170, 128, 270, "settingsChanged:"
         )
-        position_view.addSubview_(_label("Mode", 18, 227, 140))
         position_view.addSubview_(_label("Fixed point", 18, 181, 140))
         position_view.addSubview_(_label("X", 170, 207, 80, 16, size=10))
         position_view.addSubview_(_label("Y", 288, 207, 80, 16, size=10))
         for control in (
-            self.position_popup,
+            self.fixed_position_checkbox,
             self.fixed_x_field,
             self.fixed_y_field,
             self.restore_checkbox,
@@ -624,10 +685,8 @@ class AutoClickerAppDelegate(NSObject):
             self.mouse_button_popup, MOUSE_BUTTONS, settings["mouse_button"]
         )
         self._select_popup(self.click_type_popup, CLICK_TYPES, settings["click_type"])
-        self._select_popup(
-            self.position_popup, POSITION_MODES, settings["position_mode"]
-        )
         self.toggle_hotkey_field.setStringValue_(settings["toggle_hotkey"])
+        self.stop_hotkey_field.setStringValue_(settings["stop_hotkey"])
         self.exit_hotkey_field.setStringValue_(settings["exit_hotkey"])
         self.key_name_field.setStringValue_(settings["key_name"])
         self.cps_field.setStringValue_(str(settings["cps"]))
@@ -642,7 +701,19 @@ class AutoClickerAppDelegate(NSObject):
         self.restore_checkbox.setState_(
             NSControlStateValueOn if settings["restore_position"] else NSControlStateValueOff
         )
+        self.fixed_position_checkbox.setState_(
+            NSControlStateValueOn
+            if settings["position_mode"] == "fixed"
+            else NSControlStateValueOff
+        )
+        self._update_position_controls()
         self.loading_controls = False
+
+    def _update_position_controls(self) -> None:
+        enabled = self.fixed_position_checkbox.state() == NSControlStateValueOn
+        self.fixed_x_field.setEnabled_(enabled)
+        self.fixed_y_field.setEnabled_(enabled)
+        self.restore_checkbox.setEnabled_(enabled)
 
     def _settings_payload(self) -> dict:
         return {
@@ -650,6 +721,7 @@ class AutoClickerAppDelegate(NSObject):
                 self.activation_popup, ACTIVATION_MODES
             ),
             "toggle_hotkey": self.toggle_hotkey_field.stringValue(),
+            "stop_hotkey": self.stop_hotkey_field.stringValue(),
             "exit_hotkey": self.exit_hotkey_field.stringValue(),
             "output_mode": self._popup_value(self.output_popup, OUTPUT_MODES),
             "cps": self.cps_field.stringValue(),
@@ -659,8 +731,10 @@ class AutoClickerAppDelegate(NSObject):
             "click_type": self._popup_value(self.click_type_popup, CLICK_TYPES),
             "key_name": self.key_name_field.stringValue(),
             "key_hold_seconds": self.key_hold_field.stringValue(),
-            "position_mode": self._popup_value(
-                self.position_popup, POSITION_MODES
+            "position_mode": (
+                "fixed"
+                if self.fixed_position_checkbox.state() == NSControlStateValueOn
+                else "follow"
             ),
             "fixed_x": self.fixed_x_field.stringValue(),
             "fixed_y": self.fixed_y_field.stringValue(),
@@ -676,6 +750,7 @@ class AutoClickerAppDelegate(NSObject):
     def settingsChanged_(self, _sender) -> None:
         if self.loading_controls:
             return
+        self._update_position_controls()
         self.state_payload = self.service.update_settings(self._settings_payload())
         self._apply_settings(self.state_payload["settings"])
         self._refresh_from_state()
@@ -697,6 +772,10 @@ class AutoClickerAppDelegate(NSObject):
         self.state_payload = self.service.toggle()
         self._refresh_from_state()
 
+    def emergencyStop_(self, _sender) -> None:
+        self.state_payload = self.service.emergency_stop()
+        self._refresh_from_state()
+
     def toggleGlobalHotkeys_(self, _sender) -> None:
         if self.state_payload.get("global_hotkeys_enabled"):
             self.state_payload = self.service.disable_global_hotkeys()
@@ -705,8 +784,11 @@ class AutoClickerAppDelegate(NSObject):
         self._refresh_from_state()
 
     def useCursorPosition_(self, _sender) -> None:
-        self.state_payload = self.service.read_cursor_position()
-        self._apply_settings(self.state_payload["settings"])
+        self.position_pick_event_index = None
+        self.position_pick_token = None
+        self.state_payload = self.service.start_position_pick()
+        pick = self.state_payload.get("position_pick", {})
+        self.repeater_position_pick_token = pick.get("token") if pick.get("active") else None
         self._refresh_from_state()
 
     def quitApplication_(self, _sender) -> None:
@@ -735,6 +817,10 @@ class AutoClickerAppDelegate(NSObject):
         self.count_label.setStringValue_(f'{state.get("clicks_sent", 0)} actions')
         self.message_label.setStringValue_(state.get("message", ""))
         self.toggle_button.setTitle_("Stop" if state.get("running") else "Start")
+        if self.status_toggle_menu_item is not None:
+            self.status_toggle_menu_item.setTitle_(
+                "Stop Clicker" if state.get("running") else "Start Clicker"
+            )
         global_enabled = state.get("global_hotkeys_enabled", False)
         self.global_button.setTitle_(
             "Disable Global Hotkeys" if global_enabled else "Enable Global Hotkeys"
@@ -778,6 +864,25 @@ class AutoClickerAppDelegate(NSObject):
 
         pick = state.get("position_pick", {})
         result = pick.get("result")
+        repeater_pick_active = (
+            self.repeater_position_pick_token is not None and pick.get("active", False)
+        )
+        self.cursor_button.setTitle_(
+            "Waiting for Click..." if repeater_pick_active else "Capture Cursor Position"
+        )
+        self.cursor_button.setEnabled_(not pick.get("active", False))
+        if (
+            self.repeater_position_pick_token is not None
+            and result
+            and pick.get("token") == self.repeater_position_pick_token
+        ):
+            self.repeater_position_pick_token = None
+            self.service.clear_position_pick()
+            self.state_payload = self.service.set_fixed_position(result["x"], result["y"])
+            self._apply_settings(self.state_payload["settings"])
+            self._refresh_from_state()
+            return
+
         if (
             self.position_pick_event_index is not None
             and result
@@ -1159,6 +1264,7 @@ class AutoClickerAppDelegate(NSObject):
         if index < 0 or event is None or event.get("kind") != "mouse_move":
             return
         self.position_pick_event_index = index
+        self.repeater_position_pick_token = None
         self.state_payload = self.service.start_position_pick()
         pick = self.state_payload.get("position_pick", {})
         self.position_pick_token = pick.get("token")
@@ -1171,6 +1277,7 @@ class AutoClickerAppDelegate(NSObject):
             3: ("key_name", self.key_name_field),
             4: ("macro_hotkey", self.macro_hotkey_field),
             5: ("event_key", self.event_key_field),
+            6: ("stop_hotkey", self.stop_hotkey_field),
         }
         target = targets.get(sender.tag())
         if target is None:
@@ -1253,6 +1360,10 @@ class AutoClickerAppDelegate(NSObject):
             self.toggle_hotkey_field.setStringValue_(value)
             self._end_capture(restore_hotkeys=True)
             self.settingsChanged_(self.toggle_hotkey_field)
+        elif target == "stop_hotkey":
+            self.stop_hotkey_field.setStringValue_(value)
+            self._end_capture(restore_hotkeys=True)
+            self.settingsChanged_(self.stop_hotkey_field)
         elif target == "exit_hotkey":
             self.exit_hotkey_field.setStringValue_(value)
             self._end_capture(restore_hotkeys=True)

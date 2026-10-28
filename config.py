@@ -7,5 +7,6 @@ APP_TITLE = "Mac AutoClicker"
 CONFIG_VERSION = 1
 CONFIG_PATH = Path(__file__).with_name("autoclicker_settings.json")
 DEFAULT_TOGGLE_HOTKEY = "F6"
+DEFAULT_STOP_HOTKEY = "F7"
 DEFAULT_EXIT_HOTKEY = "F8"
 DEFAULT_MACRO_HOTKEY = "F9"

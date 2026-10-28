@@ -36,6 +36,7 @@ class AutoClickerService:
         self.lock = threading.RLock()
         self.native_lock = threading.Lock()
         self.hotkey_lock = threading.Lock()
+        self.hotkey_lifecycle_lock = threading.Lock()
         self.settings = ClickSettings()
         self.running = False
         self.clicks_sent = 0
@@ -43,6 +44,8 @@ class AutoClickerService:
         self.message = "Ready"
         self.global_hotkeys_enabled = False
         self.global_hotkey_status = "Off"
+        self.hotkey_start_generation = 0
+        self.shutting_down = False
         self.shutdown_callback: Optional[Callable[[], None]] = None
         self.stop_event: Optional[threading.Event] = None
         self.click_thread: Optional[threading.Thread] = None
@@ -102,11 +105,10 @@ class AutoClickerService:
                 self.settings = sanitize_click_settings(settings_payload, self.settings)
 
             macros_payload = payload.get("macros", [])
-            if isinstance(macros_payload, list):
+            if "macros" in payload and isinstance(macros_payload, list):
                 macros = self._sanitize_config_macros_locked(macros_payload)
-                if macros:
-                    self.macros = macros
-                    self._refresh_next_macro_number_locked()
+                self.macros = macros
+                self._refresh_next_macro_number_locked()
 
             self.message = "Saved settings loaded"
 
@@ -199,6 +201,7 @@ class AutoClickerService:
         with self.lock:
             settings = asdict(self.settings)
             settings["toggle_hotkey"] = format_hotkey(parse_hotkey(self.settings.toggle_hotkey))
+            settings["stop_hotkey"] = format_hotkey(parse_hotkey(self.settings.stop_hotkey))
             settings["exit_hotkey"] = format_hotkey(parse_hotkey(self.settings.exit_hotkey))
             settings["key_name"] = sanitize_key_shortcut(self.settings.key_name)
             macros = []
@@ -275,6 +278,26 @@ class AutoClickerService:
             return self.state()
         return self.toggle()
 
+    def emergency_stop(self, message: str = "All automation stopped") -> dict:
+        self.stop(message)
+        self.stop_all_macros(message)
+        with self.lock:
+            self.position_pick_active = False
+            self.position_pick_result = None
+            self.recording_active = False
+            self.recording_start_at = 0.0
+            self.recording_events = []
+            self.recording_last_event_at = 0.0
+            self.recording_last_move_at = 0.0
+            self.recording_last_move_position = None
+            self.recording_modifier_keys = frozenset()
+            self.recording_keys_down = set()
+            self.recording_mouse_buttons_down = set()
+            self.last_recorded_macro_id = ""
+            self.status = "Stopped"
+            self.message = message
+        return self.state()
+
     def create_macro(self) -> dict:
         with self.lock:
             macro_number = self.next_macro_number
@@ -345,15 +368,6 @@ class AutoClickerService:
             before = len(self.macros)
             self.macros = [macro for macro in self.macros if macro.id != macro_id]
             deleted = len(self.macros) < before
-            if not self.macros:
-                self.macros.append(
-                    MacroDefinition(
-                        id=f"macro-{self.next_macro_number}",
-                        name=f"Macro {self.next_macro_number}",
-                        events=default_macro_events(),
-                    )
-                )
-                self.next_macro_number += 1
             self.message = "Macro deleted" if deleted else "Macro not found"
             if deleted:
                 self._save_config_locked()
@@ -469,6 +483,9 @@ class AutoClickerService:
             return self.state()
 
         x, y = backend.position
+        return self.set_fixed_position(int(x), int(y))
+
+    def set_fixed_position(self, x: int, y: int) -> dict:
         self.update_settings({"fixed_x": int(x), "fixed_y": int(y), "position_mode": "fixed"})
         with self.lock:
             self.message = f"Fixed point set to {int(x)}, {int(y)}"
@@ -484,7 +501,7 @@ class AutoClickerService:
             self.position_pick_token += 1
             self.position_pick_active = True
             self.position_pick_result = None
-            self.message = "Click anywhere on screen to pick the macro move point"
+            self.message = "Click anywhere on screen to choose a position"
         return self.state()
 
     def cancel_position_pick(self) -> dict:
@@ -575,49 +592,91 @@ class AutoClickerService:
 
     def _ensure_global_hotkeys_started(self, force: bool = False) -> None:
         with self.lock:
+            if self.shutting_down:
+                return
             if self.global_hotkey_status in ("On", "Starting"):
                 return
             if self.global_hotkey_status == "Blocked" and not force:
                 return
+            self.hotkey_start_generation += 1
+            generation = self.hotkey_start_generation
             self.global_hotkeys_enabled = True
             self.global_hotkey_status = "Starting"
             self.message = "Starting global hotkeys"
 
         threading.Thread(
             target=self._start_global_hotkeys_worker,
+            args=(generation,),
             daemon=True,
             name="global-hotkey-starter",
         ).start()
 
     def disable_global_hotkeys(self) -> dict:
-        backend = self.native
-        if backend:
-            backend.stop_keyboard_events()
         with self.lock:
+            self.hotkey_start_generation += 1
             self.global_hotkeys_enabled = False
             self.global_hotkey_status = "Off"
             self.message = "Global hotkeys off"
+            backend = self.native
+        if backend:
+            with self.hotkey_lifecycle_lock:
+                with self.lock:
+                    should_stop = (
+                        not self.global_hotkeys_enabled or self.shutting_down
+                    )
+                if should_stop:
+                    backend.stop_keyboard_events()
         return self.state()
 
-    def _start_global_hotkeys_worker(self) -> None:
+    def _start_global_hotkeys_worker(self, generation: int) -> None:
         backend = self._get_native()
         if backend is None:
             with self.lock:
-                self.global_hotkeys_enabled = False
-                self.global_hotkey_status = "Blocked"
-                self.message = "macOS blocked native input access"
+                if (
+                    generation == self.hotkey_start_generation
+                    and self.global_hotkeys_enabled
+                    and not self.shutting_down
+                ):
+                    self.global_hotkeys_enabled = False
+                    self.global_hotkey_status = "Blocked"
+                    self.message = "macOS blocked native input access"
             return
 
-        backend.start_keyboard_events()
+        with self.hotkey_lifecycle_lock:
+            with self.lock:
+                should_start = (
+                    generation == self.hotkey_start_generation
+                    and self.global_hotkeys_enabled
+                    and not self.shutting_down
+                )
+            if not should_start:
+                return
+            backend.start_keyboard_events()
+
         time.sleep(0.5)
+        should_stop = False
         with self.lock:
-            if backend.keyboard_events_running:
+            current_request = (
+                generation == self.hotkey_start_generation
+                and self.global_hotkeys_enabled
+                and not self.shutting_down
+            )
+            if not current_request:
+                should_stop = not self.global_hotkeys_enabled or self.shutting_down
+            elif backend.keyboard_events_running:
                 self.global_hotkey_status = "On"
                 self.message = "Global hotkeys on"
             else:
                 self.global_hotkeys_enabled = False
                 self.global_hotkey_status = "Blocked"
                 self.message = "Enable Input Monitoring and Accessibility for Terminal/Python"
+                should_stop = True
+        if should_stop:
+            with self.hotkey_lifecycle_lock:
+                with self.lock:
+                    should_stop = not self.global_hotkeys_enabled or self.shutting_down
+                if should_stop:
+                    backend.stop_keyboard_events()
 
     def _settings_snapshot(self) -> ClickSettings:
         with self.lock:
@@ -783,6 +842,8 @@ class AutoClickerService:
 
         message = f"{macro.name} finished"
         completed = 0
+        held_keys: list[str] = []
+        held_mouse_buttons: list[str] = []
         try:
             while not stop_event.is_set() and (
                 macro.repeat_count == 0 or completed < macro.repeat_count
@@ -790,7 +851,13 @@ class AutoClickerService:
                 for event in macro.events:
                     if stop_event.is_set():
                         break
-                    self._perform_macro_event(backend, event, stop_event)
+                    self._perform_macro_event(
+                        backend,
+                        event,
+                        stop_event,
+                        held_keys,
+                        held_mouse_buttons,
+                    )
                 completed += 1
 
             if stop_event.is_set():
@@ -798,6 +865,7 @@ class AutoClickerService:
         except NativeInputError as exc:
             message = str(exc)
         finally:
+            self._release_macro_inputs(backend, held_keys, held_mouse_buttons)
             self._set_macro_finished(macro.id, message)
 
     def _perform_macro_event(
@@ -805,6 +873,8 @@ class AutoClickerService:
         backend: MacNativeInput,
         event: dict,
         stop_event: threading.Event,
+        held_keys: list[str],
+        held_mouse_buttons: list[str],
     ) -> None:
         kind = event.get("kind")
         if kind == "delay":
@@ -812,19 +882,31 @@ class AutoClickerService:
             return
 
         if kind == "key_down":
-            backend.key_down(str(event.get("key", "space")))
+            key = str(event.get("key", "space"))
+            backend.key_down(key)
+            if key not in held_keys:
+                held_keys.append(key)
             return
 
         if kind == "key_up":
-            backend.key_up(str(event.get("key", "space")))
+            key = str(event.get("key", "space"))
+            backend.key_up(key)
+            if key in held_keys:
+                held_keys.remove(key)
             return
 
         if kind == "mouse_down":
-            backend.mouse_down(str(event.get("mouse_button", "left")))
+            button = str(event.get("mouse_button", "left"))
+            backend.mouse_down(button)
+            if button not in held_mouse_buttons:
+                held_mouse_buttons.append(button)
             return
 
         if kind == "mouse_up":
-            backend.mouse_up(str(event.get("mouse_button", "left")))
+            button = str(event.get("mouse_button", "left"))
+            backend.mouse_up(button)
+            if button in held_mouse_buttons:
+                held_mouse_buttons.remove(button)
             return
 
         if kind == "mouse_move":
@@ -835,6 +917,23 @@ class AutoClickerService:
                 backend.position = (current_x + x, current_y + y)
             else:
                 backend.position = (x, y)
+
+    def _release_macro_inputs(
+        self,
+        backend: MacNativeInput,
+        held_keys: list[str],
+        held_mouse_buttons: list[str],
+    ) -> None:
+        for button in reversed(held_mouse_buttons):
+            try:
+                backend.mouse_up(button)
+            except NativeInputError:
+                pass
+        for key in reversed(held_keys):
+            try:
+                backend.key_up(key)
+            except NativeInputError:
+                pass
 
     def _set_macro_finished(self, macro_id: str, message: str) -> None:
         with self.lock:
@@ -858,7 +957,7 @@ class AutoClickerService:
                 "x": x,
                 "y": y,
             }
-            self.message = f"Picked macro move point {x}, {y}"
+            self.message = f"Picked position {x}, {y}"
 
     def _handle_macro_recording_event(self, event: dict, now: float) -> bool:
         stop_requested = False
@@ -1025,6 +1124,7 @@ class AutoClickerService:
     def _handle_global_key_down_locked(self) -> None:
         settings = self._settings_snapshot()
         toggle_hotkey = parse_hotkey(settings.toggle_hotkey)
+        stop_hotkey = parse_hotkey(settings.stop_hotkey)
         exit_hotkey = parse_hotkey(settings.exit_hotkey)
 
         if exit_hotkey and exit_hotkey <= self.pressed_keys:
@@ -1033,6 +1133,12 @@ class AutoClickerService:
                 self.stop("Exit hotkey pressed")
                 if self.shutdown_callback:
                     threading.Thread(target=self.shutdown_callback, daemon=True).start()
+            return
+
+        if stop_hotkey and stop_hotkey <= self.pressed_keys:
+            if stop_hotkey not in self.fired_combos:
+                self.fired_combos.add(stop_hotkey)
+                self.emergency_stop()
             return
 
         if toggle_hotkey and toggle_hotkey <= self.pressed_keys:
@@ -1097,8 +1203,18 @@ class AutoClickerService:
         self._handle_global_key_up_locked()
 
     def shutdown(self) -> None:
-        self.stop("Application shutting down")
-        self.stop_all_macros("Application shutting down")
-        backend = self.native
+        self.emergency_stop("Application shutting down")
+        with self.lock:
+            self.shutting_down = True
+            self.hotkey_start_generation += 1
+            self.global_hotkeys_enabled = False
+            self.global_hotkey_status = "Off"
+            macro_threads = list(self.macro_threads.values())
+            backend = self.native
+        current_thread = threading.current_thread()
+        for thread in macro_threads:
+            if thread is not current_thread:
+                thread.join(timeout=0.5)
         if backend:
-            backend.stop_keyboard_events()
+            with self.hotkey_lifecycle_lock:
+                backend.stop_keyboard_events()
